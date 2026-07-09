@@ -122,9 +122,57 @@ aws s3api put-bucket-versioning \
 
 ### Step 4 — Attach IAM role to EC2 (for S3 upload rights)
 
+**Console path:**
 - IAM -> Roles -> Create role -> **EC2** as trusted entity
 - Attach `AmazonS3FullAccess` (or a bucket-scoped custom policy)
 - EC2 Console -> instance -> **Actions -> Security -> Modify IAM role** -> attach role
+
+**Equivalent CLI commands (run from local machine or CloudShell, not the EC2 instance itself — you need existing IAM permissions to create a role):**
+
+```bash
+# 1. Create the trust policy file (allows EC2 to assume this role)
+cat > trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+# 2. Create the role
+aws iam create-role \
+  --role-name EC2-S3-CodePipeline-Role \
+  --assume-role-policy-document file://trust-policy.json
+
+# 3. Attach S3 full access policy to the role
+aws iam attach-role-policy \
+  --role-name EC2-S3-CodePipeline-Role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+# 4. Create an instance profile and add the role to it
+aws iam create-instance-profile \
+  --instance-profile-name EC2-S3-CodePipeline-Profile
+
+aws iam add-role-to-instance-profile \
+  --instance-profile-name EC2-S3-CodePipeline-Profile \
+  --role-name EC2-S3-CodePipeline-Role
+
+# 5. Attach the instance profile to the running EC2 instance
+aws ec2 associate-iam-instance-profile \
+  --instance-id i-09381c16204270c86 \
+  --iam-instance-profile Name=EC2-S3-CodePipeline-Profile
+```
+
+**Verify the role is attached (run this ON the EC2 instance):**
+```bash
+aws sts get-caller-identity
+```
+Confirms which role/identity the instance is currently authenticating as.
 
 **Concept: why an IAM role instead of access keys**
 
@@ -146,9 +194,52 @@ aws s3 ls s3://python-cicd1-source/
 
 ### Step 6 — Create the Elastic Beanstalk environment
 
+**Console path:**
 - Elastic Beanstalk -> Create application -> Platform: Python
 - Upload the same `app.zip` as the initial version (manual, one-time bootstrap)
 - Wait for environment health: **Pending -> Ok (green)**
+
+**Equivalent CLI commands (using the Elastic Beanstalk CLI, `eb`):**
+
+```bash
+# Install the EB CLI if not already present
+pip3 install awsebcli --break-system-packages
+
+# Initialize EB config inside your app folder
+cd ~/python-flask-app
+eb init -p python-3.11 python-flask-app --region ap-southeast-1
+
+# Create the environment and deploy in one step
+eb create Appbeans-env
+
+# Check status/health from the CLI
+eb status
+eb health
+
+# Open the live URL directly from terminal
+eb open
+```
+
+**Or using raw `aws` CLI (no `eb` tool):**
+```bash
+# Upload zip to the EB-managed S3 bucket and create an application version
+aws elasticbeanstalk create-application-version \
+  --application-name appbeans \
+  --version-label v1 \
+  --source-bundle S3Bucket="python-cicd1-source",S3Key="app.zip"
+
+# Create the environment using that version
+aws elasticbeanstalk create-environment \
+  --application-name appbeans \
+  --environment-name Appbeans-env \
+  --solution-stack-name "64bit Amazon Linux 2023 v4.13.3 running Python 3.14" \
+  --version-label v1
+
+# Check environment health
+aws elasticbeanstalk describe-environment-health \
+  --environment-name Appbeans-env \
+  --attribute-names All
+```
 
 **Concept: why Beanstalk needs its own service role AND instance profile (two separate identities)**
 
@@ -177,6 +268,71 @@ Pipeline configuration used:
 - **Build**: Skipped
 - **Deploy**: AWS Elastic Beanstalk -> application `appbeans` -> environment `Appbeans-env`
 
+**Equivalent CLI command (create pipeline from a JSON definition file):**
+
+```bash
+cat > pipeline.json << 'EOF'
+{
+  "pipeline": {
+    "name": "krishnaPipeline",
+    "roleArn": "arn:aws:iam::588738570955:role/service-role/AWSCodePipelineServiceRole-ap-southeast-1-krishnaPipeline",
+    "artifactStore": {
+      "type": "S3",
+      "location": "codepipeline-ap-southeast-1-artifact-store"
+    },
+    "stages": [
+      {
+        "name": "Source",
+        "actions": [
+          {
+            "name": "Source",
+            "actionTypeId": {
+              "category": "Source",
+              "owner": "AWS",
+              "provider": "S3",
+              "version": "1"
+            },
+            "outputArtifacts": [{ "name": "SourceOutput" }],
+            "configuration": {
+              "S3Bucket": "python-cicd1-source",
+              "S3ObjectKey": "app.zip",
+              "PollForSourceChanges": "false"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Deploy",
+        "actions": [
+          {
+            "name": "Deploy",
+            "actionTypeId": {
+              "category": "Deploy",
+              "owner": "AWS",
+              "provider": "ElasticBeanstalk",
+              "version": "1"
+            },
+            "inputArtifacts": [{ "name": "SourceOutput" }],
+            "configuration": {
+              "ApplicationName": "appbeans",
+              "EnvironmentName": "Appbeans-env"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+aws codepipeline create-pipeline --cli-input-json file://pipeline.json --region ap-southeast-1
+```
+
+**Check pipeline state anytime from CLI:**
+```bash
+aws codepipeline get-pipeline-state --name krishnaPipeline --region ap-southeast-1
+```
+
 ### Step 8 — First pipeline run: Deploy stage failed
 
 **Error encountered #3:**
@@ -188,12 +344,45 @@ AWS Elastic Beanstalk
 
 **Root cause:** The auto-generated CodePipeline service role (`AWSCodePipelineServiceRole-ap-southeast-1-krishnaPipeline`) had permissions for S3 and CloudWatch, but **no permissions for Elastic Beanstalk actions** — CodePipeline was authenticated, but not authorized to talk to Beanstalk's API.
 
-**Fix:**
+**Fix (Console):**
 1. IAM -> Roles -> search the exact role name shown in **Pipeline -> Settings -> Service role ARN**
 2. Add permissions -> Attach policies
 3. Note: `AWSElasticBeanstalkFullAccess` is deprecated and no longer appears in the attach-policy search
 4. Attach the modern replacement instead: **`AdministratorAccess-AWSElasticBeanstalk`**
 5. Retry the pipeline (**Release change**)
+
+**Equivalent CLI fix:**
+
+```bash
+# Attach the Elastic Beanstalk policy to the pipeline's exact service role
+aws iam attach-role-policy \
+  --role-name AWSCodePipelineServiceRole-ap-southeast-1-krishnaPipeline \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess-AWSElasticBeanstalk
+
+# If deploy still fails afterward, add inline PassRole permission
+cat > passrole-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name AWSCodePipelineServiceRole-ap-southeast-1-krishnaPipeline \
+  --policy-name PassRoleForEB \
+  --policy-document file://passrole-policy.json
+
+# Retry the pipeline execution from CLI
+aws codepipeline start-pipeline-execution \
+  --name krishnaPipeline \
+  --region ap-southeast-1
+```
 
 **Concept: why "the pipeline succeeded" and "the deploy succeeded" are two different facts**
 
@@ -211,6 +400,23 @@ krishnaPipeline    Succeeded
 
 Both Source and Deploy stages turned green. Verified the live app by reloading the Elastic Beanstalk environment URL.
 
+**Verify from CLI instead of console:**
+```bash
+# Check the latest pipeline execution status
+aws codepipeline list-pipeline-executions \
+  --pipeline-name krishnaPipeline \
+  --region ap-southeast-1 \
+  --max-items 1
+
+# Check Elastic Beanstalk environment health directly
+aws elasticbeanstalk describe-environments \
+  --environment-names Appbeans-env \
+  --query "Environments[0].[Status,Health]"
+
+# Confirm the app responds
+curl -s http://appbeans-env.eba-niqir3sn.ap-southeast-1.elasticbeanstalk.com
+```
+
 ### Step 10 — Full loop test (source of truth for "is this really CI/CD")
 
 ```bash
@@ -224,6 +430,25 @@ aws s3 cp app.zip s3://python-cicd1-source/app.zip
 - No manual "Release change" click
 - Pipeline auto-triggers within moments because the S3 object key received a new version
 - Deploy stage pushes the change to the live Beanstalk environment automatically
+
+**Confirm the new object version was created (proves the trigger mechanism, not just the upload):**
+```bash
+aws s3api list-object-versions \
+  --bucket python-cicd1-source \
+  --prefix app.zip \
+  --query "Versions[*].[VersionId,LastModified]"
+```
+
+**Watch the pipeline pick it up automatically:**
+```bash
+watch -n 5 "aws codepipeline get-pipeline-state --name krishnaPipeline --region ap-southeast-1 --query 'stageStates[*].[stageName,latestExecution.status]'"
+```
+(Run this from a machine with `watch` installed, or manually re-run the `aws codepipeline get-pipeline-state` command every few seconds.)
+
+**Confirm the updated content is live:**
+```bash
+curl -s http://appbeans-env.eba-niqir3sn.ap-southeast-1.elasticbeanstalk.com
+```
 
 ---
 
